@@ -1,57 +1,56 @@
 /**
- * Internal portal routes.
+ * Internal portal routes - Rule Extensions demo.
  *
- * Each handler below is guarded by one of our own in-house security controls.
- * Snyk Code cannot know these functions are security controls, so every one of
- * these flows is reported as a vulnerability until a Rule Extension is
- * registered for the guard.
+ * Built to the same recipe as the one sanitizer that already works
+ * (validator.isEmail / NoSqli / If True). Two properties make it work:
+ *
+ *  1. The guard is an npm package function, so the call site is
+ *     MODULE-QUALIFIED - `validator.stripLow(...)`, not a bare local call.
+ *     Snyk resolves a sanitizer's FQN from how it is referenced at the call
+ *     site; the documented supported patterns are explicit class references
+ *     and functions imported over absolute module paths. A bare local
+ *     function has no module qualifier and does not resolve.
+ *
+ *  2. The function's normal meaning does NOT match the rule it is being
+ *     registered against. Snyk already ships sanitizer knowledge for popular
+ *     libraries, so registering something it already treats as a sanitizer for
+ *     that rule changes nothing - the finding was gone before you started.
+ *     `isEmail` is not a NoSQL control, which is exactly why it had something
+ *     left to suppress.
  *
  * Rule Extension mapping:
  *
- *   toApprovedImageUrl        Flow Through   CommandInjection   exec()
- *   looksLikeInternalUserRef  If True        NoSqli             User.find()
- *   pointsOffSite             If False       OR                 res.redirect()
- *   assertPlainNoteName       Any Usage      PT                 fs.readFile()
+ *   validator.stripLow   Flow Through   CommandInjection   exec()
+ *   validator.contains   If False       OR                 res.redirect()
+ *   assert.match         Any Usage      PT                 fs.readFile()
  *
- * FQN prefix for all four: routes.portal.<functionName>
- *
- * Every guard is defined and called in THIS file on purpose. Snyk's docs warn
- * that FQNs for functions imported over relative paths do not resolve
- * reliably, and this project uses relative requires throughout.
+ * Each guard receives a plain variable, and the SAME variable reaches the sink.
+ * Never a property read or an expression built inline - Snyk treats a value
+ * reconstructed at the sink as a different object from the one the guard saw.
  */
 
 var exec = require('child_process').exec;
 var fs = require('fs');
 var path = require('path');
-var mongoose = require('mongoose');
-var User = mongoose.model('User');
+var assert = require('assert');
+var validator = require('validator');
 
-var APPROVED_IMAGE_HOSTS = ['cdn.example.com', 'images.internal.example.com'];
-var DEFAULT_IMAGE_URL = 'https://cdn.example.com/placeholder.png';
 var NOTES_DIR = '/tmp/notes';
-var NOTE_NAME_DENYLIST = ['..', '/', '\\', '\0', '~'];
+var NOTE_PATH_PATTERN = /^\/tmp\/notes\/[a-zA-Z0-9_-]{1,64}\.txt$/;
 
 // ---------------------------------------------------------------------------
-// 1. Flow Through  ->  Command Injection
+// 1. Flow Through  ->  Command Injection      FQN: validator.stripLow
 //
-// Returns a URL we consider approved. Input goes in dirty, comes out trusted.
-// The return value is still derived from user input, so Snyk keeps the taint.
+// stripLow() removes control characters and returns a string. Our team's
+// convention is to strip them before shelling out. It is not a command
+// injection control - it does nothing about ; or | - which is precisely why
+// Snyk still reports this flow, and why registering it is a decision someone
+// has to justify. Good material for the governance point.
 // ---------------------------------------------------------------------------
-
-function toApprovedImageUrl(rawUrl) {
-  var value = String(rawUrl);
-  var match = value.match(/^https:\/\/([a-z0-9.-]+)(\/[^\s]*)$/);
-
-  if (!match || APPROVED_IMAGE_HOSTS.indexOf(match[1]) === -1) {
-    return DEFAULT_IMAGE_URL;
-  }
-
-  return value;
-}
-exports.toApprovedImageUrl = toApprovedImageUrl;
 
 exports.identifyImage = function (req, res, next) {
-  var safeUrl = toApprovedImageUrl(req.query.url);
+  var imageUrl = req.query.url;
+  var safeUrl = validator.stripLow(imageUrl);
 
   exec('identify ' + safeUrl, function (err, stdout, stderr) {
     if (err !== null) {
@@ -62,57 +61,17 @@ exports.identifyImage = function (req, res, next) {
 };
 
 // ---------------------------------------------------------------------------
-// 2. If True  ->  NoSQL Injection
+// 2. If False  ->  Open Redirect              FQN: validator.contains
 //
-// Boolean guard. The value is trusted on the branch where this returns true.
-// Written as an explicit if/else so the true branch is unambiguous.
+// Inverted guard: contains(target, ':') returns TRUE when the value carries a
+// scheme, i.e. when it is dangerous. The value is trusted on the branch where
+// the call returns FALSE - relative paths only.
 // ---------------------------------------------------------------------------
-
-function looksLikeInternalUserRef(value) {
-  if (typeof value !== 'string') {
-    return false;
-  }
-  if (value.length < 4 || value.length > 128) {
-    return false;
-  }
-  return value.indexOf('@') !== -1;
-}
-exports.looksLikeInternalUserRef = looksLikeInternalUserRef;
-
-exports.findUserByRef = function (req, res, next) {
-  var userRef = req.query.ref;
-
-  if (looksLikeInternalUserRef(userRef)) {
-    User.find({ username: userRef }, function (err, users) {
-      if (err) return next(err);
-      return res.json(users);
-    });
-  } else {
-    return res.status(400).send('Invalid user reference');
-  }
-};
-
-// ---------------------------------------------------------------------------
-// 3. If False  ->  Open Redirect
-//
-// Inverted guard: returns TRUE when the value is dangerous. The value is
-// trusted on the branch where this returns false.
-// ---------------------------------------------------------------------------
-
-function pointsOffSite(target) {
-  var value = String(target);
-
-  if (value.indexOf('//') === 0) {
-    return true;
-  }
-  return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value);
-}
-exports.pointsOffSite = pointsOffSite;
 
 exports.returnTo = function (req, res, next) {
   var target = req.query.target;
 
-  if (!pointsOffSite(target)) {
+  if (!validator.contains(target, ':')) {
     return res.redirect(target);
   } else {
     return res.redirect('/');
@@ -120,39 +79,32 @@ exports.returnTo = function (req, res, next) {
 };
 
 // ---------------------------------------------------------------------------
-// 4. Any Usage  ->  Path Traversal
+// 3. Any Usage  ->  Path Traversal            FQN: assert.match
 //
-// Throws instead of returning. There is no return value to check, so
-// everything after the call is trusted by construction.
+// assert.match() throws when the value does not match. There is no return
+// value to check, so everything after the call is trusted by construction -
+// the Any Usage shape.
 //
-// Deliberately denylist-based. That is weaker than an allowlist, which is
-// precisely why Snyk will not infer it is a control - and why registering it
-// is an explicit decision someone has to own.
+// Note the guard validates notePath, the SAME variable passed to fs.readFile.
+// Building path.join() inline inside the readFile call would hand the sink a
+// value the guard never saw.
+//
+// Requires Node 13+ for assert.match. On older Node use assert.ok with a
+// pre-computed boolean - but then the sanitized argument is the boolean, not
+// notePath, and the extension will not bind.
 // ---------------------------------------------------------------------------
-
-function assertPlainNoteName(name) {
-  if (typeof name !== 'string' || name.length === 0 || name.length > 64) {
-    throw new Error('Invalid note name');
-  }
-
-  for (var i = 0; i < NOTE_NAME_DENYLIST.length; i++) {
-    if (name.indexOf(NOTE_NAME_DENYLIST[i]) !== -1) {
-      throw new Error('Invalid note name');
-    }
-  }
-}
-exports.assertPlainNoteName = assertPlainNoteName;
 
 exports.downloadNote = function (req, res, next) {
   var name = req.query.name;
+  var notePath = path.join(NOTES_DIR, name);
 
   try {
-    assertPlainNoteName(name);
+    assert.match(notePath, NOTE_PATH_PATTERN);
   } catch (e) {
     return res.status(400).send('Invalid note name');
   }
 
-  fs.readFile(path.join(NOTES_DIR, name), 'utf8', function (err, data) {
+  fs.readFile(notePath, 'utf8', function (err, data) {
     if (err) return next(err);
     return res.send(data);
   });
