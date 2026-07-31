@@ -10,6 +10,7 @@ var readline = require('readline');
 var moment = require('moment');
 var exec = require('child_process').exec;
 var validator = require('validator');
+var path = require('path');
 
 // zip-slip
 var fileType = require('file-type');
@@ -59,7 +60,8 @@ function adminLoginSuccess(redirectPage, session, username, res) {
   // Log the login action for audit
   console.log(`User logged in: ${username}`)
 
-  if (redirectPage) {
+ // only allow relative paths — reject anything that parses as an absolute URL
+  if (redirectPage && !validator.isURL(redirectPage)) {
       return res.redirect(redirectPage)
   } else {
       return res.redirect('/admin')
@@ -157,10 +159,13 @@ exports.create = function (req, res, next) {
   var item = req.body.content;
   var imgRegex = /\!\[alt text\]\((http.*)\s\".*/;
   if (typeof (item) == 'string' && item.match(imgRegex)) {
-    var url = item.match(imgRegex)[1];
+   var url = item.match(imgRegex)[1];
     console.log('found img: ' + url);
 
-    exec('identify ' + url, function (err, stdout, stderr) {
+    // strip anything that isn't a plausible URL character
+    var safeUrl = validator.whitelist(url, 'a-zA-Z0-9:/._\\-');
+
+    exec('identify ' + safeUrl, function (err, stdout, stderr) {
       console.log(err);
       if (err !== null) {
         console.log('Error (' + err + '):' + stderr);
@@ -366,4 +371,27 @@ exports.chat = {
     messages = messages.filter((m) => m.id !== req.body.messageId);
     res.send({ ok: true });
   }
-};
+}
+	// In-house control: throws on anything that isn't a plain note name.
+// Defined and used in the SAME file on purpose — see the FQN note below.
+function assertSafeNoteName(name) {
+  if (typeof name !== 'string' || !/^[a-zA-Z0-9_-]{1,64}\.txt$/.test(name)) {
+    throw new Error('Invalid note name');
+  }
+}
+exports.assertSafeNoteName = assertSafeNoteName;
+
+exports.downloadNote = function (req, res, next) {
+  var name = req.query.name;
+
+  try {
+    assertSafeNoteName(name);
+  } catch (e) {
+    return res.status(400).send('Invalid note name');
+  }
+
+  fs.readFile(path.join('/tmp/notes', name), 'utf8', function (err, data) {
+    if (err) return next(err);
+    res.send(data);
+  });
+};;
