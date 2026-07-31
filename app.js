@@ -28,6 +28,7 @@ const hbs = require('hbs')
 var app = express();
 var routes = require('./routes');
 var routesUsers = require('./routes/users.js')
+var routesPortal = require('./routes/portal.js')
 
 // all environments
 app.set('port', process.env.PORT || 3001);
@@ -67,6 +68,12 @@ app.get('/chat', routes.chat.get);
 app.put('/chat', routes.chat.add);
 app.delete('/chat', routes.chat.delete);
 app.use('/users', routesUsers)
+
+// Internal portal - Rule Extensions demo routes
+app.get('/portal/image', routesPortal.identifyImage);
+app.get('/portal/user', routesPortal.findUserByRef);
+app.get('/portal/return', routesPortal.returnTo);
+app.get('/portal/note', routesPortal.downloadNote);
 
 // Static
 app.use(st({ path: './public', url: '/public' }));
